@@ -6,15 +6,29 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QFileDialog, 
                              QProgressBar, QTabWidget, QFrame, QMessageBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QFont, QIcon
+from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QFont, QIcon, QDesktopServices
+from PyQt6.QtCore import QUrl
 from PIL import Image
 import pillow_heif
+import subprocess
 
 # 注册 HEIF 支持
 pillow_heif.register_heif_opener()
 
 # 设置 Pillow 的最大像素限制（增大到更大的值）
 Image.MAX_IMAGE_PIXELS = None
+
+
+def open_folder(path):
+    """打开文件夹"""
+    try:
+        if os.path.exists(path):
+            if os.name == 'nt':  # Windows
+                subprocess.Popen(f'explorer "{os.path.normpath(path)}"')
+            elif os.name == 'posix':  # macOS and Linux
+                subprocess.Popen(['open' if sys.platform == 'darwin' else 'xdg-open', path])
+    except Exception as e:
+        print(f"打开文件夹失败: {e}")
 
 
 class StitchWorker(QThread):
@@ -78,8 +92,30 @@ class StitchWorker(QThread):
             # 读取所有图片并保存原始信息
             self.batch_progress.emit(batch_idx + 1, batch_count, 10)
             images = []
+            dpi_info = {}  # 记录每张图片的DPI信息
+            
             for i, img_path in enumerate(image_paths):
                 img = Image.open(img_path)
+                # 获取图片的DPI信息，并转换为普通数值
+                dpi = img.info.get('dpi', (300, 300))
+                
+                # 处理各种 DPI 类型（IFDRational, int, float 等）
+                def convert_dpi(value):
+                    """转换 DPI 值为整数"""
+                    try:
+                        if hasattr(value, '__float__'):
+                            return int(float(value))
+                        elif isinstance(value, (int, float)):
+                            return int(value)
+                        else:
+                            return 300  # 默认值
+                    except:
+                        return 300
+                
+                dpi_x = convert_dpi(dpi[0])
+                dpi_y = convert_dpi(dpi[1])
+                dpi_info[i] = (dpi_x, dpi_y)
+                
                 images.append({
                     'path': img_path,
                     'filename': os.path.basename(img_path),
@@ -120,6 +156,12 @@ class StitchWorker(QThread):
             # 创建白色背景的大图
             combined = Image.new('RGB', (total_width, total_height), 'white')
             
+            # 计算拼接图的DPI（使用第一张图片的DPI作为参考）
+            if dpi_info:
+                output_dpi = dpi_info[0]
+            else:
+                output_dpi = (300, 300)
+            
             # 计算每张图在合成图中的位置并记录元数据
             metadata = []
             y_offset = 0
@@ -144,13 +186,14 @@ class StitchWorker(QThread):
                 # 粘贴图片
                 combined.paste(img_info['image'], (paste_x, paste_y))
                 
-                # 记录元数据（记录实际粘贴位置）
+                # 记录元数据（记录实际粘贴位置和DPI信息）
                 metadata.append({
                     'filename': img_info['filename'],
                     'x': paste_x,
                     'y': paste_y,
                     'width': img_info['width'],
-                    'height': img_info['height']
+                    'height': img_info['height'],
+                    'dpi': list(dpi_info[i]) if i in dpi_info else [300, 300]
                 })
                 
                 progress = 40 + int(((i + 1) / num_images) * 30)
@@ -158,12 +201,12 @@ class StitchWorker(QThread):
             
             self.progress_updated.emit(70)
             
-            # 保存为高质量 JPG
+            # 保存为高质量 JPG，保持DPI
             jpg_path = Path(output_path)
             if jpg_path.suffix.lower() != '.jpg':
                 jpg_path = jpg_path.with_suffix('.jpg')
             
-            combined.save(str(jpg_path), 'JPEG', quality=100, subsampling=0)
+            combined.save(str(jpg_path), 'JPEG', quality=100, subsampling=0, dpi=output_dpi)
             
             # 保存元数据 JSON
             json_path = jpg_path.with_suffix('.json')
@@ -213,21 +256,22 @@ class SplitWorker(QThread):
                     w = item['width']
                     h = item['height']
                     filename = item['filename']
+                    dpi = tuple(item.get('dpi', [300, 300]))  # 获取DPI信息，默认300
                     
                     # 切割图片
                     cropped = image.crop((x, y, x + w, y + h))
                     
-                    # 保存为原始文件名
+                    # 保存为原始文件名，保持DPI
                     output_path = os.path.join(self.output_dir, filename)
                     
                     # 根据原始文件扩展名保存
                     ext = Path(filename).suffix.lower()
                     if ext in ['.jpg', '.jpeg']:
-                        cropped.save(output_path, 'JPEG', quality=100, subsampling=0)
+                        cropped.save(output_path, 'JPEG', quality=100, subsampling=0, dpi=dpi)
                     elif ext == '.png':
-                        cropped.save(output_path, 'PNG')
+                        cropped.save(output_path, 'PNG', dpi=dpi)
                     else:
-                        cropped.save(output_path, 'PNG')
+                        cropped.save(output_path, 'PNG', dpi=dpi)
                     
                     output_files.append(output_path)
                     
@@ -627,7 +671,19 @@ class ImageStitcherApp(QMainWindow):
             if output_files:
                 file_list = "\n".join([f"  - {os.path.basename(f)}" for f in output_files])
                 full_message = f"{message}\n\n生成的文件：\n{file_list}"
-                QMessageBox.information(self, "完成", full_message)
+                
+                # 询问是否打开文件夹
+                reply = QMessageBox.question(
+                    self,
+                    "完成",
+                    full_message + "\n\n是否打开输出文件夹？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes
+                )
+                
+                if reply == QMessageBox.StandardButton.Yes:
+                    output_dir = os.path.dirname(output_files[0])
+                    open_folder(output_dir)
             else:
                 QMessageBox.information(self, "完成", message)
         else:
@@ -729,7 +785,18 @@ class ImageStitcherApp(QMainWindow):
                 preview_text += f"\n  ... 还有 {len(output_files) - 5} 个文件"
             
             full_message = f"{message}\n\n生成的文件（前5个）：\n{preview_text}"
-            QMessageBox.information(self, "完成", full_message)
+            
+            # 询问是否打开文件夹
+            reply = QMessageBox.question(
+                self,
+                "完成",
+                full_message + "\n\n是否打开输出文件夹？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                open_folder(self.split_output_dir)
         else:
             QMessageBox.warning(self, "错误", message)
 
@@ -737,6 +804,13 @@ class ImageStitcherApp(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+    
+    # 设置应用图标
+    icon_paths = ['app_icon.ico', 'app_icon.png']
+    for icon_path in icon_paths:
+        if os.path.exists(icon_path):
+            app.setWindowIcon(QIcon(icon_path))
+            break
     
     window = ImageStitcherApp()
     window.show()
