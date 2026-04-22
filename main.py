@@ -96,6 +96,12 @@ class StitchWorker(QThread):
             
             for i, img_path in enumerate(image_paths):
                 img = Image.open(img_path)
+                
+                # 检查并修正图片方向：确保所有图片都是纵向（高度 > 宽度）
+                # 如果是横向图片，则旋转90度变为纵向
+                if img.width > img.height:
+                    img = img.rotate(90, expand=True)
+                
                 # 获取图片的DPI信息，并转换为普通数值
                 dpi = img.info.get('dpi', (300, 300))
                 
@@ -116,12 +122,17 @@ class StitchWorker(QThread):
                 dpi_y = convert_dpi(dpi[1])
                 dpi_info[i] = (dpi_x, dpi_y)
                 
+                # 检查原始图片方向
+                original_img = Image.open(img_path)
+                was_rotated = (original_img.width > original_img.height)
+                
                 images.append({
                     'path': img_path,
                     'filename': os.path.basename(img_path),
                     'image': img,
                     'width': img.width,
-                    'height': img.height
+                    'height': img.height,
+                    'was_rotated': was_rotated
                 })
                 progress = 10 + int((i / len(image_paths)) * 20)
                 self.batch_progress.emit(batch_idx + 1, batch_count, progress)
@@ -186,14 +197,15 @@ class StitchWorker(QThread):
                 # 粘贴图片
                 combined.paste(img_info['image'], (paste_x, paste_y))
                 
-                # 记录元数据（记录实际粘贴位置和DPI信息）
+                # 记录元数据（记录实际粘贴位置、DPI信息和旋转状态）
                 metadata.append({
                     'filename': img_info['filename'],
                     'x': paste_x,
                     'y': paste_y,
                     'width': img_info['width'],
                     'height': img_info['height'],
-                    'dpi': list(dpi_info[i]) if i in dpi_info else [300, 300]
+                    'dpi': list(dpi_info[i]) if i in dpi_info else [300, 300],
+                    'was_rotated': img_info.get('was_rotated', False)
                 })
                 
                 progress = 40 + int(((i + 1) / num_images) * 30)
@@ -257,9 +269,13 @@ class SplitWorker(QThread):
                     h = item['height']
                     filename = item['filename']
                     dpi = tuple(item.get('dpi', [300, 300]))  # 获取DPI信息，默认300
+                    # was_rotated = item.get('was_rotated', False)  # 是否被旋转过（不再使用）
                     
                     # 切割图片
                     cropped = image.crop((x, y, x + w, y + h))
+                    
+                    # 保持纵向，不再恢复原始方向
+                    # 所有图片拆分后都是纵向格式
                     
                     # 保存为原始文件名，保持DPI
                     output_path = os.path.join(self.output_dir, filename)
